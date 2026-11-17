@@ -1,0 +1,25 @@
+# Cedar policy engine, layered over docker-compose.yaml:
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.cedar.yaml up -d --build
+#   (or `make up-cedar` from the repository root)
+#
+# Keycloak runs with the Cedar provider, and the bootstrap stores the Cedar
+# schema and policies in keycloak/cedar/ instead of role policies. The realm,
+# clients, tools, agentgateway and the AuthZEN request stay the same.
+services:
+  keycloak:
+    image: twogenidentity/keycloak-cedar:${KEYCLOAK_VERSION:-26.7}
+    pull_policy: build
+    build:
+      context: ./keycloak
+      args:
+        KEYCLOAK_VERSION: ${KEYCLOAK_VERSION:-26.7}
+    environment:
+      # Logs each Cedar decision and the policy statements that produced it
+      KC_LOG_LEVEL: info,com.twogenidentity.keycloak.authorization.cedar:debug
+
+  keycloak-import:
+    environment:
+      POLICY_ENGINE: cedar
+    volumes:
+      - ./keycloak/cedar:/opt/keycloak/cedar:ro

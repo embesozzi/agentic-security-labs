@@ -1,0 +1,22 @@
+// Cedar schema of mcp_proxy, the resource server of the payments MCP tools.
+// Stored in the client attribute cedar.schema. Keycloak::User and
+// Keycloak::Client come from the provider, filled from Keycloak (roles included).
+namespace Payments {
+  // Keycloak resources of type "tool", one per MCP tool, keyed by tool name:
+  // Payments::tool::"approve_payment".
+  entity tool = {
+    name: String,
+  };
+
+  // AuthZEN `context` sent by agentgateway.
+  type RequestContext = {
+    agent?: String,          // calling agent: the session token's azp
+  };
+
+  // The Keycloak authorization scope "tools/call": calling an MCP tool.
+  action "tools/call" appliesTo {
+    principal: [Keycloak::User, Keycloak::Client],
+    resource: [tool],
+    context: RequestContext,
+  };
+}

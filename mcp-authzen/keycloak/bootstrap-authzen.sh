@@ -3,11 +3,17 @@
 # roles, demo users, the two clients (mcp-client for MCP sessions, mcp_proxy as
 # the AuthZEN resource server + token-exchange requester), the audience mapper,
 # and the payments tool resources/scopes/policies/permissions.
+# POLICY_ENGINE=cedar stores Cedar policies instead of role policies.
 set -euo pipefail
 
 KCADM=/opt/keycloak/bin/kcadm.sh
-SERVER=http://keycloak:7080
+SERVER=${KEYCLOAK_URL:-http://keycloak:7080}
 REALM=mcp
+# native: Keycloak role policies; cedar: the policies in $CEDAR_DIR (Cedar provider)
+POLICY_ENGINE=${POLICY_ENGINE:-native}
+CEDAR_DIR=${CEDAR_DIR:-/opt/keycloak/cedar}
+TOOLS=(list_accounts get_account create_payment approve_payment cancel_payment)
+TOOLS_JSON=$(printf '"%s",' "${TOOLS[@]}"); TOOLS_JSON="[${TOOLS_JSON%,}]"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
@@ -15,8 +21,10 @@ log "Authenticating to master realm"
 $KCADM config credentials \
   --server "$SERVER" \
   --realm master \
-  --user admin \
-  --password admin
+  --user "${KEYCLOAK_USER:-admin}" \
+  --password "${KEYCLOAK_PASSWORD:-admin}"
+
+$KCADM update realms/master -s sslRequired=NONE
 
 log "Creating realm"
 $KCADM create realms -s realm=$REALM -s enabled=true -s sslRequired=NONE
@@ -92,46 +100,72 @@ log "Creating authorization scope 'tools/call'"
 $KCADM create "clients/$MCP_PROXY_ID/authz/resource-server/scope" -r $REALM -s 'name=tools/call'
 
 log "Creating tool resources"
-for tool in list_accounts get_account create_payment approve_payment cancel_payment; do
+for tool in "${TOOLS[@]}"; do
   $KCADM create "clients/$MCP_PROXY_ID/authz/resource-server/resource" -r $REALM \
     -s name="$tool" \
     -s type=tool \
     -s 'scopes=[{"name":"tools/call"}]'
 done
 
-log "Creating role-based policies"
-$KCADM create "clients/$MCP_PROXY_ID/authz/resource-server/policy/role" -r $REALM \
-  -s name=payments-user-policy \
-  -s 'roles=[{"id":"payments_user"}]'
+if [[ $POLICY_ENGINE == cedar ]]; then
+  # Cedar policy engine (docker-compose.cedar.yaml): the tools and the scope
+  # above stay the same, only the policies change.
+  log "Storing the Cedar schema of mcp_proxy (client attribute cedar.schema)"
+  $KCADM update "clients/$MCP_PROXY_ID" -r $REALM \
+    -s "attributes.\"cedar.schema\"=$(cat "$CEDAR_DIR/schema.cedarschema")"
 
-$KCADM create "clients/$MCP_PROXY_ID/authz/resource-server/policy/role" -r $REALM \
-  -s name=payments-manager-policy \
-  -s 'roles=[{"id":"payments_manager"}]'
+  log "Creating Cedar policies from $CEDAR_DIR"
+  CEDAR_POLICIES=()
+  for policy in "$CEDAR_DIR"/*.cedar; do
+    name=$(basename "$policy" .cedar)
+    $KCADM create "clients/$MCP_PROXY_ID/authz/resource-server/policy/cedar" -r $REALM \
+      -s "name=$name" -s "code=$(cat "$policy")"
+    CEDAR_POLICIES+=("\"$name\"")
+  done
 
-$KCADM create "clients/$MCP_PROXY_ID/authz/resource-server/policy/role" -r $REALM \
-  -s name=payments-admin-policy \
-  -s 'roles=[{"id":"payments_admin"}]'
-
-log "Creating scope permissions"
-
-# list_accounts, get_account, create_payment: any role
-for tool in list_accounts get_account create_payment; do
+  # One permission for all tools: the Cedar policies decide which tool each role may call.
+  log "Creating scope permission"
   $KCADM create "clients/$MCP_PROXY_ID/authz/resource-server/permission/scope" -r $REALM \
-    -s name="$tool-permission" \
+    -s name=tools-permission \
     -s decisionStrategy=AFFIRMATIVE \
-    -s "resources=[\"$tool\"]" \
+    -s "resources=$TOOLS_JSON" \
     -s 'scopes=["tools/call"]' \
-    -s 'policies=["payments-user-policy","payments-manager-policy","payments-admin-policy"]'
-done
+    -s "policies=[$(IFS=,; echo "${CEDAR_POLICIES[*]}")]"
+else
+  log "Creating role-based policies"
+  $KCADM create "clients/$MCP_PROXY_ID/authz/resource-server/policy/role" -r $REALM \
+    -s name=payments-user-policy \
+    -s 'roles=[{"id":"payments_user"}]'
 
-# approve_payment, cancel_payment: manager or admin only
-for tool in approve_payment cancel_payment; do
-  $KCADM create "clients/$MCP_PROXY_ID/authz/resource-server/permission/scope" -r $REALM \
-    -s name="$tool-permission" \
-    -s decisionStrategy=AFFIRMATIVE \
-    -s "resources=[\"$tool\"]" \
-    -s 'scopes=["tools/call"]' \
-    -s 'policies=["payments-manager-policy","payments-admin-policy"]'
-done
+  $KCADM create "clients/$MCP_PROXY_ID/authz/resource-server/policy/role" -r $REALM \
+    -s name=payments-manager-policy \
+    -s 'roles=[{"id":"payments_manager"}]'
 
-log "Bootstrap complete: realm '$REALM' with alice (payments_user), bob (payments_manager), carol (payments_admin), mcp-client, and mcp_proxy ready"
+  $KCADM create "clients/$MCP_PROXY_ID/authz/resource-server/policy/role" -r $REALM \
+    -s name=payments-admin-policy \
+    -s 'roles=[{"id":"payments_admin"}]'
+
+  log "Creating scope permissions"
+
+  # list_accounts, get_account, create_payment: any role
+  for tool in list_accounts get_account create_payment; do
+    $KCADM create "clients/$MCP_PROXY_ID/authz/resource-server/permission/scope" -r $REALM \
+      -s name="$tool-permission" \
+      -s decisionStrategy=AFFIRMATIVE \
+      -s "resources=[\"$tool\"]" \
+      -s 'scopes=["tools/call"]' \
+      -s 'policies=["payments-user-policy","payments-manager-policy","payments-admin-policy"]'
+  done
+
+  # approve_payment, cancel_payment: manager or admin only
+  for tool in approve_payment cancel_payment; do
+    $KCADM create "clients/$MCP_PROXY_ID/authz/resource-server/permission/scope" -r $REALM \
+      -s name="$tool-permission" \
+      -s decisionStrategy=AFFIRMATIVE \
+      -s "resources=[\"$tool\"]" \
+      -s 'scopes=["tools/call"]' \
+      -s 'policies=["payments-manager-policy","payments-admin-policy"]'
+  done
+fi
+
+log "Bootstrap complete ($POLICY_ENGINE policies): realm '$REALM' with alice (payments_user), bob (payments_manager), carol (payments_admin), mcp-client, and mcp_proxy ready"

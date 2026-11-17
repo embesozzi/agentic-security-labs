@@ -95,19 +95,98 @@ access:
 Three users are configured: `alice` (`payments_user`), `bob`
 (`payments_manager`), `carol` (`payments_admin`).
 
+### Policy engines: Keycloak default policies or Cedar policies
+
+The table above can be written in two ways in Keycloak. Only the policies
+change: the realm, the clients, the tools, agentgateway and the AuthZEN
+request stay the same, and so do the decisions.
+
+| | Keycloak default policies | Cedar policies |
+|---|---|---|
+| Keycloak | Stock image | With the [Cedar policy provider](https://github.com/embesozzi/keycloak-cedar-authorization) ([`keycloak/Dockerfile`](keycloak/Dockerfile)) |
+| Policies | Role policies and one scope permission per tool, created by the bootstrap | [`keycloak/cedar/`](keycloak/cedar/): a schema and two Cedar policies |
+| Compose | [`docker-compose.yaml`](docker-compose.yaml) | Plus [`docker-compose.cedar.yaml`](docker-compose.cedar.yaml) |
+
+With Cedar, the policy for the approval tools reads:
+
+```cedar
+@id("managers-approve-and-cancel")
+permit (
+  principal,
+  action == Payments::Action::"tools/call",
+  resource is Payments::tool
+)
+when {
+  resource in [Payments::tool::"approve_payment", Payments::tool::"cancel_payment"] &&
+  (principal in Keycloak::Role::"payments_manager" ||
+   principal in Keycloak::Role::"payments_admin")
+};
+```
+
+The names come from Keycloak and the schema
+([`schema.cedarschema`](keycloak/cedar/schema.cedarschema), stored in the
+`mcp_proxy` client attribute `cedar.schema`):
+
+| AuthZEN request | Keycloak | Cedar |
+|---|---|---|
+| `subject` `{"type": "user", "id": jwt.sub}` | The user, with its realm roles | `Keycloak::User`, in `Keycloak::Role::"payments_manager"` |
+| `resource` `{"type": "tool", "id": "approve_payment"}` | Resource `approve_payment` of type `tool` | `Payments::tool::"approve_payment"` |
+| `action` `{"name": "tools/call"}` | Scope `tools/call` | `Payments::Action::"tools/call"` |
+| `context` `{"agent": jwt.azp}` | Evaluation context | `context.agent` |
+
+For how the Cedar policy provider works and more use cases, see
+[Keycloak Cedar Authorization with AuthZEN](https://embesozzi.github.io/posts/martin-besozzi/keycloak-cedar-authorization-authzen/).
+
 ### Running the example
 
-Start Keycloak, bootstrap the realm and the payments MCP server
+The lab runs with **one** of the two policy engines: Keycloak default
+policies **or** Cedar policies. Pick one, run the use cases, and stop it
+before starting the other.
+
+**Option 1: Keycloak default policies**
 
 ```bash
-docker compose -f docker-compose.yaml up -d
+make up
 ```
+
+or, with Docker Compose from this folder:
+
+```bash
+docker compose up -d --build
+```
+
+**Option 2: Cedar policies**
+
+```bash
+make up-cedar
+```
+
+or, with Docker Compose from this folder:
+
+```bash
+docker compose \
+  -f docker-compose.yaml \
+  -f docker-compose.cedar.yaml \
+  up -d --build
+```
+
+Then, with either option:
+
+```bash
+make test   # the use cases below
+make down   # stop the lab, before switching to the other option
+```
+
+The `make` commands run from the repository root. `make up` and
+`make up-cedar` stop a running lab first. With Docker Compose, run
+`docker compose down -v` (with the same `-f` files) before switching, so
+the realm is created again with the other policies.
 
 ### Use cases
 
-[`cli-tests.sh`](cli-tests.sh) drives one MCP tool call end to end as a given
+[`cli-tests.sh`](../shared/cli-tests.sh) drives one MCP tool call end to end as a given
 user (password grant, MCP session handshake, `tools/call`), with sensible
-default arguments per tool - run `./cli-tests.sh` with no arguments for the
+default arguments per tool - run `../shared/cli-tests.sh` with no arguments for the
 full usage and examples. It's the easiest way to see the policy in action:
 
 **`alice` (`payments_user`) - read and write, no approval authority.** Alice
@@ -115,10 +194,10 @@ can look up accounts and create a payment, since those are the routine
 actions of her role, but `approve_payment` requires a role she doesn't hold:
 
 ```bash
-cd examples/mcp-authzen
-./cli-tests.sh alice list_accounts      # 200 - allowed
-./cli-tests.sh alice create_payment     # 200 - allowed, creates pay-1
-./cli-tests.sh alice approve_payment    # 403 - denied
+cd mcp-authzen
+../shared/cli-tests.sh alice list_accounts      # 200 - allowed
+../shared/cli-tests.sh alice create_payment     # 200 - allowed, creates pay-1
+../shared/cli-tests.sh alice approve_payment    # 403 - denied
 ```
 
 **`bob` (`payments_manager`) - can also approve or cancel.** Bob has
@@ -126,7 +205,7 @@ everything Alice has, plus the ability to approve the payment she created,
 reflecting the manager role's extra scope in the access table above:
 
 ```bash
-./cli-tests.sh bob approve_payment      # 200 - allowed, approves pay-1
+../shared/cli-tests.sh bob approve_payment      # 200 - allowed, approves pay-1
 ```
 
 **`carol` (`payments_admin`) - same tool access as manager here.** The admin
@@ -135,7 +214,7 @@ grants carol exactly the same access as bob, since the policy is defined
 per tool/role pair rather than by a role hierarchy:
 
 ```bash
-./cli-tests.sh carol cancel_payment '{"payment_id":"pay-1"}'   # 200 - allowed
+../shared/cli-tests.sh carol cancel_payment '{"payment_id":"pay-1"}'   # 200 - allowed
 ```
 
 What to notice:
@@ -147,11 +226,15 @@ What to notice:
   only the AuthZEN decision for `{subject: <user>, resource: <tool>, action:
   "tools/call"}` changes, driven entirely by Keycloak policies, nothing
   tool-specific is hardcoded in agentgateway's config.
+- The results are the same with Keycloak default and Cedar policies: the PEP does not
+  know, or need to know, how the PDP decides.
 - `initialize` and `tools/list` always succeed regardless of role, since
   `extAuthz` only fires when `mcp.tool` is set (i.e. on `tools/call`).
 
 ### References
 
 - [Implementing OpenID AuthZEN in Agent Gateway](https://embesozzi.github.io/posts/martin-besozzi/implementing-openid-authzen-in-agentgateway/) - blog post walking through this lab
+- [Keycloak Cedar Authorization with AuthZEN](https://embesozzi.github.io/posts/martin-besozzi/keycloak-cedar-authorization-authzen/) - blog post on the Cedar policy provider
+- [keycloak-cedar-authorization](https://github.com/embesozzi/keycloak-cedar-authorization) - the Cedar policy provider for Keycloak
 - [AuthZEN Authorization API 1.0](https://openid.net/specs/openid-authzen-authorization-api-1_0-ID1.html)
 - [AuthZEN CoAZ MCP binding](https://openid.github.io/authzen/authzen-coaz-mcp-binding-1_0.html)

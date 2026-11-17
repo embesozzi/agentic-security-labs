@@ -6,7 +6,7 @@ set -euo pipefail
 
 usage() {
   cat <<EOF
-Usage: $0 <user> <tool> [json-args]
+Usage: $(basename "$0") <user> <tool> [json-args]
 
   ./cli-tests.sh alice list_accounts     # allowed - any role
   ./cli-tests.sh alice create_payment    # allowed - creates pay-1
@@ -25,6 +25,12 @@ if [[ $# -lt 2 ]]; then
   exit 1
 fi
 
+# Defaults match mcp-authzen (Keycloak). For another IdP, set IDP_URL and
+# MCP_CLIENT_SECRET.
+IDP_URL="${IDP_URL:-${KEYCLOAK_URL:-http://localhost:7080}}"
+GATEWAY_URL="${GATEWAY_URL:-http://localhost:3000}"
+MCP_CLIENT_SECRET="${MCP_CLIENT_SECRET:-mcp-client-secret}"
+
 USER="$1"
 TOOL="$2"
 ARGS="${3:-}"
@@ -39,28 +45,28 @@ if [[ -z "$ARGS" ]]; then
   esac
 fi
 
-TOKEN=$(curl -s http://localhost:7080/realms/mcp/protocol/openid-connect/token \
-  -u mcp-client:mcp-client-secret \
+TOKEN=$(curl -s "$IDP_URL/realms/mcp/protocol/openid-connect/token" \
+  -u "mcp-client:$MCP_CLIENT_SECRET" \
   -d grant_type=password -d "username=$USER" -d "password=${USER}123" -d scope=openid \
   | jq -r .access_token)
 [[ "$TOKEN" != null ]] || { echo "Error: could not get a token for $USER" >&2; exit 1; }
 
 # MCP over streamable HTTP is session-based: initialize first and reuse the
 # Mcp-Session-Id it returns for the actual tool call.
-SESSION=$(curl -si http://localhost:3000/mcp \
+SESSION=$(curl -si "$GATEWAY_URL/mcp" \
   -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -H 'accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cli-tests","version":"1.0"}}}' \
   | grep -i '^mcp-session-id:' | tr -d '\r' | awk '{print $2}') || true
 [[ -n "$SESSION" ]] || { echo "Error: no MCP session from agentgateway" >&2; exit 1; }
 
-curl -s -o /dev/null http://localhost:3000/mcp \
+curl -s -o /dev/null "$GATEWAY_URL/mcp" \
   -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -H 'accept: application/json, text/event-stream' -H "mcp-session-id: $SESSION" \
   -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 
 echo "user=$USER tool=$TOOL args=$ARGS"
-curl -s -w '\nHTTP %{http_code}\n' http://localhost:3000/mcp \
+curl -s -w '\nHTTP %{http_code}\n' "$GATEWAY_URL/mcp" \
   -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -H 'accept: application/json, text/event-stream' -H "mcp-session-id: $SESSION" \
   -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$TOOL\",\"arguments\":$ARGS}}"
